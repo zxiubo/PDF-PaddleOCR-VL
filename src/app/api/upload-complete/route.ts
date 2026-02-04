@@ -51,8 +51,8 @@ export async function POST(request: NextRequest) {
       );
     }
 
-    // 合并文件块
-    const result = mergeChunks(userId, file_id);
+    // 合并文件块（使用await，因为mergeChunks现在是异步的）
+    const result = await mergeChunks(userId, file_id);
 
     if (!result.success) {
       return NextResponse.json(

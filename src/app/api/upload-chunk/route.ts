@@ -111,8 +111,8 @@ export async function POST(request: NextRequest) {
     // 读取文件块数据
     const chunkData = Buffer.from(await chunk.arrayBuffer());
 
-    // 保存文件块
-    const result = saveChunk(userId, fileId, chunk_index, chunkData);
+    // 保存文件块（使用await，因为saveChunk现在是异步的）
+    const result = await saveChunk(userId, fileId, chunk_index, chunkData);
 
     if (!result.success) {
       return NextResponse.json(

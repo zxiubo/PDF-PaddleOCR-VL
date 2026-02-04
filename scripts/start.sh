@@ -35,9 +35,9 @@ start_service() {
     mkdir -p "${APP_TEMP_DIR}/queue"
     echo "✓ temp/tasks, temp/cache and temp/queue directories ready"
     
-    # 启动后台处理器
+    # 启动后台处理器（确保使用相同的环境变量）
     echo "Starting background task processor..."
-    node "${COZE_WORKSPACE_PATH}/scripts/background-processor.js" > /tmp/background-processor.log 2>&1 &
+    env APP_TEMP_DIR="${APP_TEMP_DIR}" COZE_WORKSPACE_PATH="${COZE_WORKSPACE_PATH}" node "${COZE_WORKSPACE_PATH}/scripts/background-processor.js" > /tmp/background-processor.log 2>&1 &
     BG_PID=$!
     echo "✓ Background processor started (PID: ${BG_PID})"
     

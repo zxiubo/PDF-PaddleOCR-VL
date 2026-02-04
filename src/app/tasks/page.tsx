@@ -80,6 +80,20 @@ interface TaskMetadata {
   is_background?: boolean;
 }
 
+// 调试信息接口
+interface DebugInfo {
+  tempBaseDir: string;
+  tasksBaseDir: string;
+  userTaskDir: string;
+  userDirExists: boolean;
+  userDirContents: string[];
+  env: {
+    APP_TEMP_DIR: string | null;
+    COZE_WORKSPACE_PATH: string | null;
+    NODE_ENV: string | null;
+  };
+}
+
 export default function TasksPage() {
   const router = useRouter();
   const [tasks, setTasks] = useState<TaskMetadata[]>([]);
@@ -89,6 +103,10 @@ export default function TasksPage() {
   const [batchDeleting, setBatchDeleting] = useState(false);
   const [clearingAll, setClearingAll] = useState(false);
   
+  // 调试信息状态
+  const [debugInfo, setDebugInfo] = useState<DebugInfo | null>(null);
+  const [showDebugInfo, setShowDebugInfo] = useState(false);
+   
   // 任务详情对话框状态
   const [showTaskDetail, setShowTaskDetail] = useState(false);
   const [selectedTask, setSelectedTask] = useState<TaskMetadata | null>(null);
@@ -137,6 +155,10 @@ export default function TasksPage() {
       const data = await response.json();
       if (data.success) {
         setTasks(data.tasks);
+        // 保存调试信息
+        if (data.debug) {
+          setDebugInfo(data.debug);
+        }
       }
     } catch (error) {
       console.error('获取任务列表失败:', error);
@@ -167,81 +189,110 @@ export default function TasksPage() {
     }
 
     const userId = getCurrentUserId();
-    const eventSource = new EventSource(`/api/tasks/${selectedTask.id}/stream?user_id=${userId}`);
+    const taskId = selectedTask.id;
+    let retryCount = 0;
+    const MAX_RETRIES = 3;
+    let eventSource: EventSource | null = null;
+    let isManuallyClosed = false;
+    let retryTimeoutId: NodeJS.Timeout | null = null;
 
-    eventSource.onmessage = (event) => {
-      const data = JSON.parse(event.data);
-      
-      if (data.type === 'log') {
-        setStreamLogs(prev => [...prev, data.message]);
-      } else if (data.type === 'progress') {
-        if (selectedTask) {
-          setSelectedTask({
-            ...selectedTask,
-            progress: data.progress,
-            elapsed_time: data.elapsed_time
-          });
+    const connect = () => {
+      if (retryCount >= MAX_RETRIES) {
+        console.error('[SSE] 重连次数超过限制，停止重试');
+        return;
+      }
+
+      retryCount++;
+
+      eventSource = new EventSource(`/api/tasks/${taskId}/stream?user_id=${userId}`);
+
+      eventSource.onopen = () => {
+        // 连接成功，重置重试计数
+        retryCount = 0;
+      };
+
+      eventSource.onmessage = (event) => {
+        // 忽略心跳消息
+        if (event.data.startsWith(':heartbeat')) {
+          return;
         }
-      } else if (data.type === 'status') {
-        if (selectedTask) {
-          setSelectedTask({
-            ...selectedTask,
-            status: data.status,
-            completed_at: data.completed_at,
-            elapsed_time: data.elapsed_time,
-            progress: data.progress ?? 100  // 使用后端发送的进度，如果没有则默认为100
-          });
-          // 任务完成后关闭SSE连接
-          if (data.status === 'completed' || data.status === 'failed') {
-            eventSource.close();
+
+        try {
+          const data = JSON.parse(event.data);
+
+          if (data.type === 'log') {
+            setStreamLogs(prev => [...prev, data.message]);
+          } else if (data.type === 'progress') {
+            setSelectedTask(prev => prev ? {
+              ...prev,
+              progress: data.progress,
+              elapsed_time: data.elapsed_time
+            } : null);
+          } else if (data.type === 'status') {
+            setSelectedTask(prev => prev ? {
+              ...prev,
+              status: data.status,
+              completed_at: data.completed_at,
+              elapsed_time: data.elapsed_time,
+              progress: data.progress ?? 100
+            } : null);
+            // 任务完成后关闭SSE连接
+            if (data.status === 'completed' || data.status === 'failed') {
+              isManuallyClosed = true;
+              eventSource?.close();
+            }
+          } else if (data.type === 'error') {
+            // 服务端返回错误，显示错误但不重试
+            setSelectedTask(prev => prev ? {
+              ...prev,
+              status: 'failed',
+              error: data.error
+            } : null);
+            isManuallyClosed = true;
+            eventSource?.close();
           }
+        } catch (parseError) {
+          console.error('[SSE] 解析消息失败:', parseError);
         }
-      } else if (data.type === 'error') {
-        if (selectedTask) {
-          setSelectedTask({
-            ...selectedTask,
-            status: 'failed',
-            error: data.error
-          });
+      };
+
+      eventSource.onerror = () => {
+        // 如果手动关闭，不重试
+        if (isManuallyClosed) {
+          return;
         }
-        eventSource.close();
-      }
+
+        // 只有在连接真正关闭时才重试
+        if (eventSource?.readyState === EventSource.CLOSED) {
+          // 固定3秒重连间隔
+          const delay = 3000;
+
+          if (retryTimeoutId) {
+            clearTimeout(retryTimeoutId);
+          }
+
+          retryTimeoutId = setTimeout(() => {
+            if (!isManuallyClosed && retryCount < MAX_RETRIES) {
+              connect();
+            }
+          }, delay);
+        }
+        // CONNECTING 状态让浏览器自动处理，OPEN 状态忽略错误
+      };
     };
 
-    eventSource.onerror = (error) => {
-      // SSE连接关闭通常是正常行为（任务完成、用户关闭弹窗、清理函数执行）
-      // 根据readyState判断是否为真正的错误
-      if (eventSource.readyState === EventSource.CLOSED) {
-        // 正常关闭，静默处理，不关闭EventSource（它已经关闭了）
-        console.log('[SSE] 连接已正常关闭');
-      } else if (eventSource.readyState === EventSource.CONNECTING) {
-        // 连接失败，等待重试（浏览器会自动重试）
-        // 不要调用 close()，否则会阻止浏览器的自动重连机制
-        console.warn('[SSE] 连接中断，浏览器将自动重连');
-      } else {
-        // 其他未知状态（OPEN但出现错误），记录详细信息
-        console.error('[SSE] 异常状态:', {
-          readyState: eventSource.readyState,
-          readyStateName: eventSource.readyState === 0 ? 'CONNECTING' : 
-                          eventSource.readyState === 1 ? 'OPEN' : 
-                          eventSource.readyState === 2 ? 'CLOSED' : 'UNKNOWN',
-          selectedTask: selectedTask ? {
-            id: selectedTask.id,
-            status: selectedTask.status,
-            is_background: selectedTask.is_background
-          } : null
-        });
-        // 对于OPEN状态但出现错误的情况，可以选择关闭连接
-        // 但也不要关闭，让浏览器决定是否重试
-      }
-      // 不要在这里调用 eventSource.close()！
-      // cleanup函数会在组件卸载时自动关闭
-    };
+    // 首次连接
+    connect();
 
     return () => {
-      eventSource.close();
+      isManuallyClosed = true;
+      if (retryTimeoutId) {
+        clearTimeout(retryTimeoutId);
+      }
+      eventSource?.close();
     };
-  }, [showTaskDetail, selectedTask]);
+    // 使用具体值作为依赖，避免对象引用变化导致重复执行
+  }, [showTaskDetail, selectedTask?.id, selectedTask?.is_background, selectedTask?.status]);
 
   const handleDeleteTask = async (taskId: string) => {
     setDeletingTask(taskId);
@@ -555,10 +606,76 @@ export default function TasksPage() {
               <p className="text-slate-600 dark:text-slate-400 mb-6">
                 还没有创建任何提取任务
               </p>
-              <Button onClick={() => router.push('/')}>
-                <FileText className="w-4 h-4 mr-2" />
-                创建第一个任务
-              </Button>
+              <div className="flex flex-col items-center gap-3">
+                <Button onClick={() => router.push('/')}>
+                  <FileText className="w-4 h-4 mr-2" />
+                  创建第一个任务
+                </Button>
+                
+                {/* 调试信息按钮 */}
+                {debugInfo && (
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    onClick={() => setShowDebugInfo(!showDebugInfo)}
+                    className="text-slate-500"
+                  >
+                    {showDebugInfo ? '隐藏调试信息' : '显示调试信息'}
+                  </Button>
+                )}
+              </div>
+              
+              {/* 调试信息面板 */}
+              {showDebugInfo && debugInfo && (
+                <div className="mt-6 p-4 bg-slate-100 dark:bg-slate-800 rounded-lg text-left">
+                  <h4 className="text-sm font-semibold mb-3 text-slate-700 dark:text-slate-300">
+                    调试信息（帮助排查任务丢失问题）
+                  </h4>
+                  <div className="space-y-2 text-xs font-mono text-slate-600 dark:text-slate-400">
+                    <div className="grid grid-cols-[120px_1fr] gap-2">
+                      <span className="text-slate-500">临时目录:</span>
+                      <span className="break-all">{debugInfo.tempBaseDir}</span>
+                    </div>
+                    <div className="grid grid-cols-[120px_1fr] gap-2">
+                      <span className="text-slate-500">任务目录:</span>
+                      <span className="break-all">{debugInfo.tasksBaseDir}</span>
+                    </div>
+                    <div className="grid grid-cols-[120px_1fr] gap-2">
+                      <span className="text-slate-500">用户目录:</span>
+                      <span className="break-all">{debugInfo.userTaskDir}</span>
+                    </div>
+                    <div className="grid grid-cols-[120px_1fr] gap-2">
+                      <span className="text-slate-500">目录存在:</span>
+                      <span className={debugInfo.userDirExists ? 'text-green-600' : 'text-red-600'}>
+                        {debugInfo.userDirExists ? '是' : '否'}
+                      </span>
+                    </div>
+                    {debugInfo.userDirExists && (
+                      <div className="grid grid-cols-[120px_1fr] gap-2">
+                        <span className="text-slate-500">目录内容:</span>
+                        <span>{debugInfo.userDirContents.length > 0 ? `${debugInfo.userDirContents.length} 个任务` : '空'}</span>
+                      </div>
+                    )}
+                    <div className="mt-3 pt-3 border-t border-slate-200 dark:border-slate-700">
+                      <div className="text-slate-500 mb-1">环境变量:</div>
+                      <div className="pl-2 space-y-1">
+                        <div>APP_TEMP_DIR: {debugInfo.env.APP_TEMP_DIR || '未设置'}</div>
+                        <div>COZE_WORKSPACE_PATH: {debugInfo.env.COZE_WORKSPACE_PATH || '未设置'}</div>
+                        <div>NODE_ENV: {debugInfo.env.NODE_ENV || '未设置'}</div>
+                      </div>
+                    </div>
+                    {!debugInfo.userDirExists && (
+                      <div className="mt-3 p-2 bg-yellow-50 dark:bg-yellow-900/20 rounded text-yellow-700 dark:text-yellow-400">
+                        <strong>可能的原因:</strong><br />
+                        1. 临时目录配置不一致（检查 APP_TEMP_DIR 环境变量）<br />
+                        2. 服务器重启导致 /tmp 目录被清空<br />
+                        3. 用户ID发生变化（浏览器 localStorage 被清除）<br />
+                        4. 部署环境使用了不同的临时目录
+                      </div>
+                    )}
+                  </div>
+                </div>
+              )}
             </CardContent>
           </Card>
         ) : (

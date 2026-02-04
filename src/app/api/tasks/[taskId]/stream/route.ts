@@ -19,7 +19,7 @@ function getProjectRoot(): string {
  */
 function getTempDir(): string {
   const root = getProjectRoot();
-  
+
   const testDir = path.join(root, 'temp');
   try {
     if (!fs.existsSync(testDir)) {
@@ -37,6 +37,23 @@ function getTempDir(): string {
 }
 
 /**
+ * 创建 SSE 错误流
+ */
+function createErrorStream(message: string) {
+  const encoder = new TextEncoder();
+  return new ReadableStream({
+    start(controller) {
+      const errorData = {
+        type: 'error',
+        error: message
+      };
+      controller.enqueue(encoder.encode(`data: ${JSON.stringify(errorData)}\n\n`));
+      controller.close();
+    }
+  });
+}
+
+/**
  * GET /api/tasks/[taskId]/stream
  * SSE 实时推送任务日志和状态更新
  */
@@ -48,10 +65,15 @@ export async function GET(
   const searchParams = request.nextUrl.searchParams;
   const userId = searchParams.get('user_id');
 
+  // 错误处理：始终返回 SSE 格式
   if (!userId) {
-    return new Response(JSON.stringify({ success: false, message: '缺少用户ID' }), { 
-      status: 400,
-      headers: { 'Content-Type': 'application/json' }
+    return new Response(createErrorStream('缺少用户ID'), {
+      status: 200, // SSE 不能返回 4xx，否则浏览器不会解析
+      headers: {
+        'Content-Type': 'text/event-stream',
+        'Cache-Control': 'no-cache',
+        'Connection': 'keep-alive',
+      },
     });
   }
 
@@ -59,25 +81,37 @@ export async function GET(
   const taskMetadata = await readTaskMetadata(taskId);
 
   if (!taskMetadata) {
-    return new Response(JSON.stringify({ success: false, message: '任务不存在' }), { 
-      status: 404,
-      headers: { 'Content-Type': 'application/json' }
+    return new Response(createErrorStream('任务不存在'), {
+      status: 200,
+      headers: {
+        'Content-Type': 'text/event-stream',
+        'Cache-Control': 'no-cache',
+        'Connection': 'keep-alive',
+      },
     });
   }
 
   // 验证用户权限
   if (taskMetadata.user_id !== userId) {
-    return new Response(JSON.stringify({ success: false, message: '无权访问该任务' }), { 
-      status: 403,
-      headers: { 'Content-Type': 'application/json' }
+    return new Response(createErrorStream('无权访问该任务'), {
+      status: 200,
+      headers: {
+        'Content-Type': 'text/event-stream',
+        'Cache-Control': 'no-cache',
+        'Connection': 'keep-alive',
+      },
     });
   }
 
   // 检查是否为后台任务
   if (!taskMetadata.is_background) {
-    return new Response(JSON.stringify({ success: false, message: '该任务不是后台任务，不支持SSE' }), { 
-      status: 400,
-      headers: { 'Content-Type': 'application/json' }
+    return new Response(createErrorStream('该任务不是后台任务，不支持SSE'), {
+      status: 200,
+      headers: {
+        'Content-Type': 'text/event-stream',
+        'Cache-Control': 'no-cache',
+        'Connection': 'keep-alive',
+      },
     });
   }
 
@@ -90,8 +124,30 @@ export async function GET(
       let lastStatus = taskMetadata.status;
       let lastProgress = taskMetadata.progress || 0;
       let intervalId: NodeJS.Timeout | null = null;
+      let isControllerClosed = false;
+      let heartbeatId: NodeJS.Timeout | null = null;
+
+      // 安全的 enqueue 函数
+      const safeEnqueue = (data: string) => {
+        if (!isControllerClosed) {
+          try {
+            controller.enqueue(encoder.encode(data));
+          } catch (error) {
+            if ((error as Error).message?.includes('Controller is already closed')) {
+              isControllerClosed = true;
+            }
+          }
+        }
+      };
 
       try {
+        // 发送心跳保持连接
+        heartbeatId = setInterval(() => {
+          if (!isControllerClosed) {
+            safeEnqueue(':heartbeat\n\n');
+          }
+        }, 30000); // 每30秒发送一次心跳
+
         // 发送初始状态
         const sendInitialStatus = () => {
           try {
@@ -103,22 +159,26 @@ export async function GET(
               records_count: queueTask?.records_count ?? taskMetadata.records_count ?? 0,
               error: taskMetadata.error ?? queueTask?.error
             };
-            controller.enqueue(encoder.encode(`data: ${JSON.stringify(status)}\n\n`));
-            
+            safeEnqueue(`data: ${JSON.stringify(status)}\n\n`);
+
             // 如果任务已经完成或失败，不启动轮询，直接关闭连接
             if (status.status === 'completed' || status.status === 'failed') {
               setTimeout(() => {
-                try {
-                  controller.close();
-                } catch (error) {
-                  console.error('[SSE] 关闭连接失败:', error);
+                if (!isControllerClosed) {
+                  try {
+                    isControllerClosed = true;
+                    if (heartbeatId) clearInterval(heartbeatId);
+                    if (intervalId) clearInterval(intervalId);
+                    controller.close();
+                  } catch (error) {
+                    // 忽略关闭错误
+                  }
                 }
               }, 500);
               return false; // 不启动轮询
             }
             return true; // 启动轮询
           } catch (error) {
-            console.error('[SSE] 发送初始状态失败:', error);
             return false; // 不启动轮询
           }
         };
@@ -129,11 +189,11 @@ export async function GET(
             // 检查任务状态变化
             const queueTask = getTaskById(taskId);
             const updatedMetadata = await readTaskMetadata(taskId);
-            
-            const currentStatus: 'pending' | 'processing' | 'completed' | 'failed' = 
+
+            const currentStatus: 'pending' | 'processing' | 'completed' | 'failed' =
               (queueTask?.status || updatedMetadata?.status) || 'pending';
             const currentProgress = queueTask?.progress ?? updatedMetadata?.progress ?? 0;
-            
+
             if (currentStatus !== lastStatus || currentProgress !== lastProgress) {
               // 发送状态更新
               const statusUpdate = {
@@ -145,8 +205,8 @@ export async function GET(
                 elapsed_time: updatedMetadata?.elapsed_time ?? queueTask?.elapsed_time,
                 completed_at: updatedMetadata?.completed_at
               };
-              controller.enqueue(encoder.encode(`data: ${JSON.stringify(statusUpdate)}\n\n`));
-              
+              safeEnqueue(`data: ${JSON.stringify(statusUpdate)}\n\n`);
+
               lastStatus = currentStatus;
               lastProgress = currentProgress;
 
@@ -156,13 +216,20 @@ export async function GET(
                   clearInterval(intervalId);
                   intervalId = null;
                 }
-                
+                if (heartbeatId) {
+                  clearInterval(heartbeatId);
+                  heartbeatId = null;
+                }
+
                 // 发送最后的状态后关闭连接
                 setTimeout(() => {
-                  try {
-                    controller.close();
-                  } catch (error) {
-                    console.error('[SSE] 关闭连接失败:', error);
+                  if (!isControllerClosed) {
+                    try {
+                      isControllerClosed = true;
+                      controller.close();
+                    } catch (error) {
+                      // 忽略关闭错误
+                    }
                   }
                 }, 1000);
                 return;
@@ -173,41 +240,41 @@ export async function GET(
             if (fs.existsSync(logFile)) {
               try {
                 const stats = fs.statSync(logFile);
-                
+
                 if (stats.size > lastLogSize) {
                   // 读取新增的日志内容
                   const buffer = Buffer.alloc(stats.size - lastLogSize);
                   const fd = fs.openSync(logFile, 'r');
                   fs.readSync(fd, buffer, 0, buffer.length, lastLogSize);
                   fs.closeSync(fd);
-                  
+
                   const newContent = buffer.toString('utf-8');
                   const newLogs = newContent.split('\n').filter(line => line.trim() !== '');
-                  
+
                   // 发送新日志
                   newLogs.forEach(logLine => {
                     const logUpdate = {
                       type: 'log',
                       message: logLine
                     };
-                    controller.enqueue(encoder.encode(`data: ${JSON.stringify(logUpdate)}\n\n`));
+                    safeEnqueue(`data: ${JSON.stringify(logUpdate)}\n\n`);
                   });
-                  
+
                   lastLogSize = stats.size;
                 }
               } catch (error) {
-                console.error('[SSE] 读取日志文件失败:', error);
+                // 忽略日志读取错误
               }
             }
 
           } catch (error) {
-            console.error('[SSE] 检查更新失败:', error);
+            // 忽略检查更新错误
           }
         };
 
         // 立即发送初始状态
         const shouldStartPolling = sendInitialStatus();
-        
+
         // 只有任务还在处理中才启动轮询
         if (shouldStartPolling) {
           // 每1秒检查一次更新
@@ -215,20 +282,22 @@ export async function GET(
         }
 
       } catch (error) {
-        console.error('[SSE] 流初始化失败:', error);
-        try {
-          controller.close();
-        } catch (e) {
-          console.error('[SSE] 关闭流失败:', e);
+        if (!isControllerClosed) {
+          try {
+            isControllerClosed = true;
+            if (heartbeatId) clearInterval(heartbeatId);
+            if (intervalId) clearInterval(intervalId);
+            controller.close();
+          } catch (e) {
+            // 忽略关闭错误
+          }
         }
       }
 
       // 清理函数
       return () => {
-        if (intervalId) {
-          clearInterval(intervalId);
-          intervalId = null;
-        }
+        if (heartbeatId) clearInterval(heartbeatId);
+        if (intervalId) clearInterval(intervalId);
       };
     },
   });

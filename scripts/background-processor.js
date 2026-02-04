@@ -722,7 +722,7 @@ async function extractRecruitmentInfo(text, headers, recordIndex, taskDir) {
       
       const command = `node "${path.join(PROJECT_ROOT, 'scripts', 'llm-extract.js')}" "${ocrTextFile}" "${headersFile}" "${recordIndex}"`;
       
-      // 设置超时时间（180秒）
+      // 设置超时时间（300秒 = 5分钟）
       const timeout = setTimeout(() => {
         // 清理临时文件
         try {
@@ -731,10 +731,10 @@ async function extractRecruitmentInfo(text, headers, recordIndex, taskDir) {
         } catch (cleanupError) {
           console.error('清理临时文件失败:', cleanupError);
         }
-        reject(new Error('LLM提取超时（180秒）'));
-      }, 180000);
+        reject(new Error('LLM提取超时（300秒）'));
+      }, 300000);
       
-      exec(command, { cwd: PROJECT_ROOT, timeout: 180000 }, (error, stdout, stderr) => {
+      exec(command, { cwd: PROJECT_ROOT, timeout: 300000 }, (error, stdout, stderr) => {
         clearTimeout(timeout);
         
         // 清理临时文件

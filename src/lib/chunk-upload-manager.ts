@@ -2,6 +2,35 @@ import fs from 'fs';
 import path from 'path';
 import { getTempBaseDir, ensureDirectory } from './task-manager';
 
+// 文件锁Map，用于防止并发写入元数据
+const fileLocks = new Map<string, Promise<void>>();
+
+/**
+ * 获取文件锁，确保元数据操作的原子性
+ */
+async function acquireLock(lockKey: string): Promise<() => void> {
+  // 等待当前锁释放
+  while (fileLocks.has(lockKey)) {
+    try {
+      await fileLocks.get(lockKey);
+    } catch {
+      // 忽略错误，继续等待
+    }
+  }
+
+  // 创建新的锁
+  let release: () => void;
+  const lockPromise = new Promise<void>((resolve) => {
+    release = () => {
+      fileLocks.delete(lockKey);
+      resolve();
+    };
+  });
+
+  fileLocks.set(lockKey, lockPromise);
+  return release!;
+}
+
 /**
  * 分块上传文件接口
  */
@@ -115,12 +144,15 @@ export function getFileMetadata(userId: string, fileId: string): ChunkedFileInfo
 /**
  * 保存文件块
  */
-export function saveChunk(
+export async function saveChunk(
   userId: string,
   fileId: string,
   chunkIndex: number,
   chunkData: Buffer
-): { success: boolean; message: string } {
+): Promise<{ success: boolean; message: string }> {
+  const lockKey = `${userId}:${fileId}`;
+  const release = await acquireLock(lockKey);
+
   try {
     const chunksDir = getChunksDir(userId, fileId);
     const chunkPath = path.join(chunksDir, `${chunkIndex}.chunk`);
@@ -128,12 +160,13 @@ export function saveChunk(
     // 保存块文件
     fs.writeFileSync(chunkPath, chunkData);
 
-    // 更新元数据
+    // 重新读取元数据（获取最新状态）
     const metadata = getFileMetadata(userId, fileId);
     if (!metadata) {
       return { success: false, message: '文件元数据不存在' };
     }
 
+    // 检查块是否已存在（幂等性）
     if (!metadata.uploaded_chunks.includes(chunkIndex)) {
       metadata.uploaded_chunks.push(chunkIndex);
       metadata.uploaded_chunks.sort((a, b) => a - b);
@@ -147,13 +180,21 @@ export function saveChunk(
   } catch (error) {
     console.error('保存文件块失败:', error);
     return { success: false, message: `保存块 ${chunkIndex} 失败: ${error}` };
+  } finally {
+    release();
   }
 }
 
 /**
  * 合并文件块
  */
-export function mergeChunks(userId: string, fileId: string): { success: boolean; message: string; filePath?: string } {
+export async function mergeChunks(
+  userId: string,
+  fileId: string
+): Promise<{ success: boolean; message: string; filePath?: string }> {
+  const lockKey = `${userId}:${fileId}`;
+  const release = await acquireLock(lockKey);
+
   try {
     const metadata = getFileMetadata(userId, fileId);
     if (!metadata) {
@@ -164,49 +205,67 @@ export function mergeChunks(userId: string, fileId: string): { success: boolean;
       return { success: false, message: `文件状态错误: ${metadata.status}` };
     }
 
+    // 重新读取元数据以获取最新状态（避免并发上传时数据不一致）
+    const latestMetadata = getFileMetadata(userId, fileId);
+    if (!latestMetadata) {
+      return { success: false, message: '文件元数据不存在' };
+    }
+
     // 检查所有块是否都已上传
     const missingChunks: number[] = [];
-    for (let i = 0; i < metadata.total_chunks; i++) {
-      if (!metadata.uploaded_chunks.includes(i)) {
+    for (let i = 0; i < latestMetadata.total_chunks; i++) {
+      if (!latestMetadata.uploaded_chunks.includes(i)) {
         missingChunks.push(i);
       }
     }
 
     if (missingChunks.length > 0) {
-      return { 
-        success: false, 
-        message: `缺少 ${missingChunks.length} 个块: [${missingChunks.join(', ')}]` 
+      return {
+        success: false,
+        message: `缺少 ${missingChunks.length} 个块: [${missingChunks.join(', ')}]`
       };
     }
 
-    // 合并块
+    // 合并块 - 使用管道流确保数据完全写入
     const chunksDir = getChunksDir(userId, fileId);
     const fileDir = getFileUploadDir(userId, fileId);
-    const mergedFilePath = path.join(fileDir, metadata.original_name);
-    const writeStream = fs.createWriteStream(mergedFilePath);
+    const mergedFilePath = path.join(fileDir, latestMetadata.original_name);
 
-    for (let i = 0; i < metadata.total_chunks; i++) {
-      const chunkPath = path.join(chunksDir, `${i}.chunk`);
-      const chunkData = fs.readFileSync(chunkPath);
-      writeStream.write(chunkData);
-    }
+    await new Promise<void>((resolve, reject) => {
+      const writeStream = fs.createWriteStream(mergedFilePath);
 
-    writeStream.end();
+      writeStream.on('finish', resolve);
+      writeStream.on('error', reject);
+
+      try {
+        for (let i = 0; i < latestMetadata.total_chunks; i++) {
+          const chunkPath = path.join(chunksDir, `${i}.chunk`);
+          const chunkData = fs.readFileSync(chunkPath);
+          writeStream.write(chunkData);
+        }
+        writeStream.end();
+      } catch (error) {
+        writeStream.destroy();
+        reject(error);
+      }
+    });
 
     // 更新元数据
-    metadata.status = 'completed';
-    metadata.completed_at = new Date().toISOString();
+    latestMetadata.status = 'completed';
+    latestMetadata.completed_at = new Date().toISOString();
     const metadataPath = path.join(fileDir, 'metadata.json');
-    fs.writeFileSync(metadataPath, JSON.stringify(metadata, null, 2));
+    fs.writeFileSync(metadataPath, JSON.stringify(latestMetadata, null, 2));
 
-    return { 
-      success: true, 
+    return {
+      success: true,
       message: '文件合并成功',
       filePath: mergedFilePath
     };
   } catch (error) {
     console.error('合并文件块失败:', error);
     return { success: false, message: `合并失败: ${error}` };
+  } finally {
+    release();
   }
 }
 

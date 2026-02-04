@@ -96,7 +96,18 @@ export default function RecruitmentInfoExtractor() {
       // 获取任务详情以恢复模板信息
       const userId = getCurrentUserId();
       fetch(`/api/tasks/${taskId}?user_id=${encodeURIComponent(userId)}`)
-        .then(res => res.json())
+        .then(res => {
+          // 检查响应是否成功
+          if (!res.ok) {
+            throw new Error(`HTTP ${res.status}: ${res.statusText}`);
+          }
+          // 检查内容类型
+          const contentType = res.headers.get('content-type');
+          if (!contentType || !contentType.includes('application/json')) {
+            throw new Error(`Expected JSON but got ${contentType}`);
+          }
+          return res.json();
+        })
         .then(data => {
           if (data.success && data.task?.upload_files) {
             // 查找自定义模板文件
@@ -280,9 +291,29 @@ export default function RecruitmentInfoExtractor() {
     const CHUNK_SIZE = 2 * 1024 * 1024; // 2MB
     const totalChunks = Math.ceil(file.size / CHUNK_SIZE);
     const userId = getCurrentUserId();
+    const MAX_RETRIES = 3;
+    const RETRY_DELAY = 1000; // 1秒
 
     let fileId = '';
     let currentChunk = 0;
+
+    // 带重试的fetch函数
+    const fetchWithRetry = async (url: string, options: RequestInit, retries = MAX_RETRIES): Promise<Response> => {
+      try {
+        const response = await fetch(url, options);
+        if (!response.ok && retries > 0) {
+          throw new Error(`HTTP ${response.status}`);
+        }
+        return response;
+      } catch (error) {
+        if (retries > 0) {
+          console.warn(`请求失败，${RETRY_DELAY}ms后重试，剩余${retries}次:`, error);
+          await new Promise(resolve => setTimeout(resolve, RETRY_DELAY));
+          return fetchWithRetry(url, options, retries - 1);
+        }
+        throw error;
+      }
+    };
 
     // 上传每个块
     for (currentChunk = 0; currentChunk < totalChunks; currentChunk++) {
@@ -300,7 +331,8 @@ export default function RecruitmentInfoExtractor() {
         formData.append('file_id', fileId);
       }
 
-      const response = await fetch('/api/upload-chunk', {
+      // 使用重试机制上传
+      const response = await fetchWithRetry('/api/upload-chunk', {
         method: 'POST',
         body: formData,
       });
@@ -322,8 +354,8 @@ export default function RecruitmentInfoExtractor() {
       }
     }
 
-    // 通知服务端合并文件
-    const completeResponse = await fetch('/api/upload-complete', {
+    // 通知服务端合并文件（也使用重试机制）
+    const completeResponse = await fetchWithRetry('/api/upload-complete', {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',

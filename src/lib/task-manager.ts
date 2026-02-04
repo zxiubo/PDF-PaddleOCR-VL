@@ -17,38 +17,39 @@ function getProjectRoot(): string {
 /**
  * 获取基础临时目录
  * 在部署环境中使用可写的临时目录（通常是 /tmp）
+ * 
+ * 重要：这个函数必须在所有进程中返回相同的值，否则会导致任务丢失
  */
 export function getTempBaseDir(): string {
-  // 优先使用 APP_TEMP_DIR 环境变量
+  // 优先使用 APP_TEMP_DIR 环境变量（这是保证一致性的关键）
   if (process.env.APP_TEMP_DIR) {
     return process.env.APP_TEMP_DIR;
   }
   
-  // 获取当前工作目录和项目根目录
+  // 如果没有设置环境变量，根据环境自动检测
   const cwd = process.cwd();
   const projectRoot = getProjectRoot();
   
   // 强制检测：如果项目根目录在 /opt/bytefaas 下，使用 /tmp/app-temp
   if (projectRoot.includes('/opt/bytefaas')) {
-    console.log('[DEBUG] Detected /opt/bytefaas in project root, using /tmp/app-temp');
+    console.warn('[TempDir] WARNING: APP_TEMP_DIR not set, auto-detecting /tmp/app-temp');
     return path.join('/tmp', 'app-temp');
   }
-  
+
   // 如果当前工作目录在 /opt/bytefaas 下，使用 /tmp/app-temp
   if (cwd.includes('/opt/bytefaas')) {
-    console.log('[DEBUG] Detected /opt/bytefaas in cwd, using /tmp/app-temp');
+    console.warn('[TempDir] WARNING: APP_TEMP_DIR not set, auto-detecting /tmp/app-temp');
     return path.join('/tmp', 'app-temp');
   }
-  
+
   // 生产环境默认使用 /tmp/app-temp
   if (process.env.NODE_ENV === 'production') {
-    console.log('[DEBUG] Production environment, using /tmp/app-temp');
+    console.warn('[TempDir] WARNING: APP_TEMP_DIR not set in production, using /tmp/app-temp');
     return path.join('/tmp', 'app-temp');
   }
-  
+
   // 开发环境使用项目根目录下的 temp
   const tempDir = path.join(projectRoot, 'temp');
-  console.log('[DEBUG] Development environment, using:', tempDir);
   return tempDir;
 }
 
@@ -254,7 +255,12 @@ export function readTaskMetadata(taskId: string, userId?: string): TaskMetadata 
  * @param userId 可选，如果提供则只返回该用户的任务
  */
 export function getAllTasks(userId?: string): TaskMetadata[] {
-  if (!fs.existsSync(getTasksBaseDir())) {
+  const tasksBaseDir = getTasksBaseDir();
+  
+  console.log(`[getAllTasks] Using tasks directory: ${tasksBaseDir}, userId: ${userId || 'all'}`);
+  
+  if (!fs.existsSync(tasksBaseDir)) {
+    console.warn(`[getAllTasks] Tasks directory does not exist: ${tasksBaseDir}`);
     return [];
   }
 
@@ -262,41 +268,58 @@ export function getAllTasks(userId?: string): TaskMetadata[] {
 
   // 如果指定了 userId，只遍历该用户的目录
   if (userId) {
-    const userTaskDir = path.join(getTasksBaseDir(), userId);
+    const userTaskDir = path.join(tasksBaseDir, userId);
     if (!fs.existsSync(userTaskDir)) {
+      console.warn(`[getAllTasks] User task directory does not exist: ${userTaskDir}`);
       return [];
     }
 
-    const taskDirs = fs.readdirSync(userTaskDir, { withFileTypes: true });
-    
-    for (const dir of taskDirs) {
-      if (dir.isDirectory()) {
-        const metadata = readTaskMetadata(dir.name, userId);
-        if (metadata) {
-          tasks.push(metadata);
-        }
-      }
-    }
-  } else {
-    // 遍历所有用户的目录
-    const userDirs = fs.readdirSync(getTasksBaseDir(), { withFileTypes: true });
-
-    for (const userDir of userDirs) {
-      if (userDir.isDirectory()) {
-        const userTaskDir = path.join(getTasksBaseDir(), userDir.name);
-        const taskDirs = fs.readdirSync(userTaskDir, { withFileTypes: true });
-
-        for (const dir of taskDirs) {
-          if (dir.isDirectory()) {
-            const metadata = readTaskMetadata(dir.name, userDir.name);
-            if (metadata) {
-              tasks.push(metadata);
-            }
+    try {
+      const taskDirs = fs.readdirSync(userTaskDir, { withFileTypes: true });
+      console.log(`[getAllTasks] Found ${taskDirs.length} entries in user directory`);
+      
+      for (const dir of taskDirs) {
+        if (dir.isDirectory()) {
+          const metadata = readTaskMetadata(dir.name, userId);
+          if (metadata) {
+            tasks.push(metadata);
           }
         }
       }
+    } catch (error) {
+      console.error(`[getAllTasks] Error reading user directory ${userTaskDir}:`, error);
+    }
+  } else {
+    // 遍历所有用户的目录
+    try {
+      const userDirs = fs.readdirSync(tasksBaseDir, { withFileTypes: true });
+      console.log(`[getAllTasks] Found ${userDirs.length} user directories`);
+
+      for (const userDir of userDirs) {
+        if (userDir.isDirectory()) {
+          const userTaskDir = path.join(tasksBaseDir, userDir.name);
+          try {
+            const taskDirs = fs.readdirSync(userTaskDir, { withFileTypes: true });
+
+            for (const dir of taskDirs) {
+              if (dir.isDirectory()) {
+                const metadata = readTaskMetadata(dir.name, userDir.name);
+                if (metadata) {
+                  tasks.push(metadata);
+                }
+              }
+            }
+          } catch (error) {
+            console.error(`[getAllTasks] Error reading task directory for user ${userDir.name}:`, error);
+          }
+        }
+      }
+    } catch (error) {
+      console.error(`[getAllTasks] Error reading tasks base directory:`, error);
     }
   }
+
+  console.log(`[getAllTasks] Returning ${tasks.length} tasks`);
 
   // 按创建时间降序排序
   return tasks.sort((a, b) => 
